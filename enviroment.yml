@@ -5,6 +5,7 @@ channels:
 dependencies:
     - python=3.10
     - pillow
+    - python-dotenv
     - pip
     - pip:
           - PySimpleGUI

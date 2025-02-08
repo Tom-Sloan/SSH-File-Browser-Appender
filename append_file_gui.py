@@ -18,7 +18,22 @@ TOAST_DURATION    = 5                         # how many seconds toast stays up
 TOAST_WIDTH       = 250
 TOAST_HEIGHT      = 80
 
-# A “folder yellow” color (e.g. Windows folder style)
+# Default values (will be overridden by .env if it exists)
+DEFAULT_HOST = ""
+DEFAULT_USER = ""
+DEFAULT_BASE_DIR = ""
+
+# Try to load values from .env file if it exists
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    DEFAULT_HOST = os.getenv('DEFAULT_HOST', DEFAULT_HOST)
+    DEFAULT_USER = os.getenv('DEFAULT_USER', DEFAULT_USER)
+    DEFAULT_BASE_DIR = os.getenv('DEFAULT_BASE_DIR', DEFAULT_BASE_DIR)
+except ImportError:
+    pass  # python-dotenv not installed, will use empty defaults
+
+# A "folder yellow" color (e.g. Windows folder style)
 FOLDER_YELLOW = (255, 201, 14)
 
 # ----------------------------------------------------------------
@@ -146,12 +161,9 @@ def remove_node(tree_data, key):
     del tree_data.tree_dict[key]
 
 def add_folder_node(tree_data, parent, key, text, is_expanded=False):
-    """Insert a folder node with a “has_been_expanded” flag in values[0]."""
-    print(f"Adding folder: {text}")  # Added: Print folder name when created
     tree_data.Insert(parent, key, text, values=[is_expanded], icon=SMALL_FOLDER_ICON)
 
 def add_file_node(tree_data, parent, key, text):
-    """Insert a file node (no dummy child)."""
     tree_data.Insert(parent, key, text, values=[], icon=SMALL_FILE_ICON)
 
 def expand_ancestors_recursively(tree_element, node_key):
@@ -213,6 +225,25 @@ def get_file_content_sftp(sftp, remote_path):
         return f.read()  # keep original formatting
 
 # ----------------------------------------------------------------
+# Path Shortening
+# ----------------------------------------------------------------
+def short_path(base_dir, full_path):
+    """
+    Return the portion of `full_path` after `base_dir`.
+    e.g. base_dir=/home/sam3/abc, full_path=/home/sam3/abc/hello => /hello
+    If full_path doesn't start with base_dir, return full_path as-is.
+    """
+    # Ensure both have no trailing slash
+    bd = base_dir.rstrip('/')
+    if full_path.startswith(bd):
+        remainder = full_path[len(bd):]
+        if not remainder.startswith('/'):
+            remainder = '/' + remainder
+        return remainder
+    else:
+        return full_path
+
+# ----------------------------------------------------------------
 # Main GUI
 # ----------------------------------------------------------------
 def main():
@@ -221,24 +252,25 @@ def main():
 
     recents = load_recents()
     all_files = set()     # discovered file paths for search suggestions
-    selected_files = []   # user-chosen files
+    selected_files = []   # store full paths internally
     current_selected_dir = None
+
     # Left column
     left_col = [
-        [sg.Text("Host"), sg.Input("134.117.167.139", key='-HOST-')],
-        [sg.Text("User"), sg.Input("sam3", key='-USERNAME-')],
+        [sg.Text("Host"), sg.Input(DEFAULT_HOST, key='-HOST-')],
+        [sg.Text("User"), sg.Input(DEFAULT_USER, key='-USERNAME-')],
         [sg.Text("Pass"), sg.Input("", password_char='*', key='-PASSWORD-')],
         [sg.Text("Base Dir")],
-        [sg.Input("/home/sam3/Desktop/Toms_Workspace/WorldSystem/", key='-BASE_DIR-', size=(35,1))],
+        [sg.Input(DEFAULT_BASE_DIR, key='-BASE_DIR-', size=(35,1))],
         [sg.Button("Connect & Load", key='-CONNECT-')],
         [sg.Text("Recents:")],
         [
-            sg.Combo(values=recents, size=(30,1), key='-RECENTS-'),
+            sg.Combo(values=[], size=(30,1), key='-RECENTS-'),  # We'll populate after connect
             sg.Button("Add Recents", key='-ADD_RECENT-')
         ],
         [sg.Text("Selected Files:")],
         [
-            sg.Listbox(values=selected_files, 
+            sg.Listbox(values=[], 
                        size=(40,5), 
                        key='-SELECTED-', 
                        select_mode='extended')
@@ -260,18 +292,18 @@ def main():
         col0_width=40,
         num_rows=20,
         key='-TREE-',
-        show_expanded=True,  # folders appear closed initially
+        show_expanded=True,
         enable_events=True
     )
 
-    # A “Google‐style” autocomplete approach with an Input + Listbox
+    # A "Google‐style" autocomplete approach with an Input + Listbox
     search_bar = sg.Input(key='-SEARCH-', enable_events=True, size=(40,1))
     suggestion_box = sg.Listbox(
         [], 
         key='-SUGGESTIONS-', 
         size=(40,4), 
         visible=False,
-        select_mode='single',    # replaced sg.SINGLE with 'single'
+        select_mode='single',    
         enable_events=True, 
         no_scrollbar=True
     )
@@ -284,7 +316,6 @@ def main():
         [suggestion_box]
     ]
 
-    # Right column: appended text
     right_col = [
         [sg.Text("Appended Text:", font=("Helvetica", 12, "bold"))],
         [
@@ -323,7 +354,17 @@ def main():
     current_suggestions = []
     suggestion_index = -1
 
-    def update_suggestions_box(query):
+    def update_recents_combo(base_dir):
+        """Show short versions of each path in recents."""
+        short_list = [short_path(base_dir, r) for r in recents]
+        window['-RECENTS-'].update(values=short_list)
+
+    def update_selected_listbox(base_dir):
+        """Show short versions of the currently selected files."""
+        short_list = [short_path(base_dir, f) for f in selected_files]
+        window['-SELECTED-'].update(values=short_list)
+
+    def update_suggestions_box(base_dir, query):
         nonlocal current_suggestions, suggestion_index
         query = query.strip()
         if not query:
@@ -333,13 +374,18 @@ def main():
             return
 
         ql = query.lower()
-        matches = [f for f in all_files if ql in f.lower()]
-        matches = matches[:8]
-        current_suggestions = matches
+        # partial match on the full path
+        matches_full = [f for f in all_files if ql in f.lower()]
+        matches_full = matches_full[:8]
+
+        # store them as (full_path, short_path)
+        # we only show short_path in the listbox
+        current_suggestions = [(fp, short_path(base_dir, fp)) for fp in matches_full]
         suggestion_index = -1
 
-        if matches:
-            window['-SUGGESTIONS-'].update(values=matches, visible=True)
+        if current_suggestions:
+            short_vals = [item[1] for item in current_suggestions]
+            window['-SUGGESTIONS-'].update(values=short_vals, visible=True)
         else:
             window['-SUGGESTIONS-'].update(values=[], visible=False)
 
@@ -358,11 +404,17 @@ def main():
         if ssh: ssh.close()
 
         try:
-            ssh, sftp = get_sftp_connection(host, user, pwd)
-            # Build tree with base_dir as root
+            ssh_, sftp_ = get_sftp_connection(host, user, pwd)
+            # If successful, set them globally
+            ssh, sftp = ssh_, sftp_
+
+            # Build tree with base_dir as root (not listing subitems until user expands)
             new_tree = sg.TreeData()
             new_tree.Insert("", base_dir, base_dir, values=[False], icon=SMALL_FOLDER_ICON)
             all_files.clear()
+
+            # Update recents combo
+            update_recents_combo(base_dir)
 
             window['-TREE-'].update(new_tree)
             window.refresh()
@@ -375,6 +427,8 @@ def main():
         event, values = window.read()
         if event in (sg.WIN_CLOSED, 'Exit'):
             break
+
+        base_dir = values['-BASE_DIR-'].strip()  # current base dir from user
 
         if event == '-CONNECT-':
             do_connect()
@@ -394,34 +448,41 @@ def main():
                         window['-ADD_ALL-'].update(disabled=False)
                         current_selected_dir = node_key
                     else:
-                        # file => add
+                        # file => add to selected
                         if node_key not in selected_files:
                             selected_files.append(node_key)
-                            window['-SELECTED-'].update(selected_files)
-                            window['-ADD_ALL-'].update(disabled=True)
-                            current_selected_dir = None
+                        current_selected_dir = None
+                        window['-ADD_ALL-'].update(disabled=True)
+
+                    # Update the selected listbox with short paths
+                    update_selected_listbox(base_dir)
+
                 except Exception as ex:
                     show_toast(f"lstat error: {ex}")
 
         elif event == '-SEARCH-':
-            text = values['-SEARCH-']
-            update_suggestions_box(text)
+            query = values['-SEARCH-']
+            update_suggestions_box(base_dir, query)
 
         elif event == '-SUGGESTIONS-':
-            chosen = values['-SUGGESTIONS-']
-            if chosen:
-                chosen_str = chosen[0]
-                window['-SEARCH-'].update(chosen_str)
-                if chosen_str in current_suggestions:
-                    suggestion_index = current_suggestions.index(chosen_str)
+            # user clicked a suggestion => fill search bar
+            chosen_idx = window['-SUGGESTIONS-'].get_indexes()
+            if chosen_idx:
+                idx = chosen_idx[0]
+                if 0 <= idx < len(current_suggestions):
+                    # current_suggestions is a list of (full_path, short_path)
+                    full_p, short_p = current_suggestions[idx]
+                    window['-SEARCH-'].update(short_p)
+                    suggestion_index = idx
 
         elif event.startswith("Up") or event.startswith("Down") or event.startswith("special"):
             is_search_focused = (window.find_element_with_focus() == window['-SEARCH-'])
             if is_search_focused and current_suggestions:
-                # handle arrow keys
+                # handle arrow keys for suggestion navigation
                 if "Up" in event or "16777235" in event:
                     suggestion_index -= 1
-                    if suggestion_index < 0: suggestion_index = 0
+                    if suggestion_index < 0:
+                        suggestion_index = 0
                     window['-SUGGESTIONS-'].update(set_to_index=[suggestion_index])
                 elif "Down" in event or "16777237" in event:
                     suggestion_index += 1
@@ -432,12 +493,19 @@ def main():
                 # user hits Enter
                 if "Return" in event or "16777220" in event:
                     if 0 <= suggestion_index < len(current_suggestions):
-                        chosen_item = current_suggestions[suggestion_index]
+                        full_p, short_p = current_suggestions[suggestion_index]
+                        # add to selected
+                        if full_p not in selected_files:
+                            selected_files.append(full_p)
+                        update_selected_listbox(base_dir)
                     else:
-                        chosen_item = values['-SEARCH-'].strip()
-                    if chosen_item and chosen_item not in selected_files:
-                        selected_files.append(chosen_item)
-                        window['-SELECTED-'].update(selected_files)
+                        typed = values['-SEARCH-'].strip()
+                        if typed:
+                            # we have to guess the full path => no direct mapping?
+                            # We'll assume typed is a substring that existed
+                            # or just store typed as is
+                            selected_files.append(typed)
+                            update_selected_listbox(base_dir)
                     window['-SUGGESTIONS-'].update(values=[], visible=False)
                     current_suggestions.clear()
                     suggestion_index = -1
@@ -448,36 +516,55 @@ def main():
             is_search_focused = (window.find_element_with_focus() == window['-SEARCH-'])
             if is_search_focused and not current_suggestions:
                 typed = values['-SEARCH-'].strip()
-                if typed and typed not in selected_files:
-                    selected_files.append(typed)
-                    window['-SELECTED-'].update(selected_files)
+                if typed:
+                    # store typed as is or do an attempt to find a full path
+                    # For now, we just store typed => not guaranteed to exist
+                    if typed not in selected_files:
+                        selected_files.append(typed)
+                    update_selected_listbox(base_dir)
                 window['-SEARCH-'].update("")
                 window['-SUGGESTIONS-'].update(values=[], visible=False)
 
         elif event == '-ADD_RECENT-':
-            rec = values['-RECENTS-']
-            if rec and rec not in selected_files:
-                selected_files.append(rec)
-                window['-SELECTED-'].update(selected_files)
+            # The recents combo is showing short paths, so we must find the matching full
+            short_value = values['-RECENTS-']
+            if short_value:
+                # Convert it back to a full path by re-prepending base_dir
+                # or see if it matches an existing full path in recents
+                # Because we actually store recents as full paths
+                # we can find the index in short_pathed recents
+                try:
+                    idx = [short_path(base_dir, r) for r in recents].index(short_value)
+                    fullp = recents[idx]
+                    if fullp not in selected_files:
+                        selected_files.append(fullp)
+                    update_selected_listbox(base_dir)
+                except ValueError:
+                    # user typed something not in recents
+                    pass
 
         elif event == 'Remove Selected':
             to_remove = values['-SELECTED-']
-            if to_remove:
-                for item in to_remove:
-                    if item in selected_files:
-                        selected_files.remove(item)
-                window['-SELECTED-'].update(selected_files)
+            # those are short paths => convert them back to full if needed
+            # We'll match them to full paths in selected_files
+            all_short = [short_path(base_dir, f) for f in selected_files]
+            for shorty in to_remove:
+                if shorty in all_short:
+                    idx = all_short.index(shorty)
+                    realp = selected_files[idx]
+                    selected_files.remove(realp)
+            update_selected_listbox(base_dir)
 
         elif event == 'Clear All':
             selected_files.clear()
-            window['-SELECTED-'].update(selected_files)
+            update_selected_listbox(base_dir)
 
         elif event == 'Fetch & Append':
             if not sftp:
                 show_toast("Not connected!")
                 continue
 
-            # add newly selected tree items if they're files
+            # also add newly selected tree items if they're files
             tree_sel = values['-TREE-']
             if tree_sel:
                 for item in tree_sel:
@@ -487,7 +574,7 @@ def main():
                             selected_files.append(item)
                     except:
                         pass
-                window['-SELECTED-'].update(selected_files)
+                update_selected_listbox(base_dir)
 
             if not selected_files:
                 show_toast("No files selected!", duration=2)
@@ -502,13 +589,11 @@ def main():
                     else:
                         # read file, preserve newlines
                         content = get_file_content_sftp(sftp, fpath)
-                        # append "=== file ===\ncontent\n"
                         new_chunks.append(f"=== {fpath} ===\n{content}\n")
                 except Exception as e:
                     new_chunks.append(f"=== {fpath} ===\n[Error reading file: {e}]\n")
 
             current_text = window['-APPENDED-'].get()
-            # Join with newlines => multiline formatting preserved
             appended_text = current_text + "\n".join(new_chunks) + "\n"
 
             window['-APPENDED-'].update(appended_text, visible=True)
@@ -527,16 +612,14 @@ def main():
 
         elif event == '-ADD_ALL-':
             if current_selected_dir and sftp:
-                # list everything in the folder, add direct files only (no recursion)
                 try:
                     entries = sftp.listdir_attr(current_selected_dir)
                     for e in entries:
                         full_path = join_sftp_path(current_selected_dir, e.filename)
                         if not is_dir_attr(e.st_mode):
-                            # It's a file => add
                             if full_path not in selected_files:
                                 selected_files.append(full_path)
-                    window['-SELECTED-'].update(selected_files)
+                    update_selected_listbox(base_dir)
                 except Exception as e:
                     show_toast(f"Cannot read folder: {e}")
 
