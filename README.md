@@ -33,6 +33,16 @@ conda activate append_file_gui
 python append_file_gui.py
 ```
 
+## Default Settings
+
+The default settings are stored in the `.env` file. If you want to change the default settings, you can edit the `.env` file.
+
+DEFAULT_HOST=123.456.789.101
+DEFAULT_USER=user
+DEFAULT_BASE_DIR=/home/user/project/
+
+## Usage
+
 1. **Connect to Server**
 
     - Enter host, username, password
