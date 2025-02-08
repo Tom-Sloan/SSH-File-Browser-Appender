@@ -2,6 +2,8 @@
 
 A GUI tool to browse remote files via SSH/SFTP, select multiple files, and append their contents into a single text block. Ideal for situations where you need to combine file contents for AI analysis or documentation.
 
+This tool was created to help with the process of combining multiple files into something I could paste into an AI chat when they won't let me attach the files.
+
 ## Features
 
 -   📁 Connect to SSH servers with password authentication
