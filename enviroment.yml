@@ -1,0 +1,11 @@
+name: append_file_gui
+channels:
+    - defaults
+    - conda-forge
+dependencies:
+    - python=3.10
+    - pillow
+    - pip
+    - pip:
+          - PySimpleGUI
+          - paramiko

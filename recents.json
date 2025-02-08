@@ -1,0 +1,17 @@
+[
+  "/home/sam3/Desktop/Toms_Workspace/WorldSystem/server/src/core/frame_processor.py",
+  "/home/sam3/Desktop/Toms_Workspace/WorldSystem/server/src/config/settings.py",
+  "/home/sam3/Desktop/Toms_Workspace/WorldSystem/server/src/core/visualization_data_relay.py",
+  "/home/sam3/Desktop/Toms_Workspace/WorldSystem/docker-compose.yml",
+  "/home/sam3/Desktop/Toms_Workspace/WorldSystem/server/src/api/websocket.py",
+  "/home/sam3/Desktop/Toms_Workspace/WorldSystem/server/src/api/routes.py",
+  "/home/sam3/Desktop/Toms_Workspace/WorldSystem/server/environment.yml",
+  "/home/sam3/Desktop/Toms_Workspace/WorldSystem/server/Dockerfile",
+  "/home/sam3/Desktop/Toms_Workspace/WorldSystem/server/main.py",
+  "/home/sam3/Desktop/Toms_Workspace/WorldSystem/start.sh",
+  "/home/sam3/Desktop/Toms_Workspace/WorldSystem/fantasy/main.py",
+  "/home/sam3/Desktop/Toms_Workspace/WorldSystem/.gitmodules",
+  "/home/sam3/Desktop/Toms_Workspace/WorldSystem/.env",
+  "/home/sam3/Desktop/Toms_Workspace/WorldSystem/.gitignore",
+  "/home/sam3/Desktop/Toms_Workspace/WorldSystem/prometheus.yml"
+]
