@@ -6,6 +6,7 @@ dependencies:
     - python=3.10
     - pillow
     - python-dotenv
+    - tiktoken
     - pip
     - pip:
           - PySimpleGUI

@@ -7,6 +7,8 @@ import paramiko
 import PySimpleGUI as sg
 from PIL import Image
 import time
+import stat  # for local file mode operations
+import tiktoken  # NEW: for token counting
 
 # ----------------------------------------------------------------
 # Constants / Config
@@ -21,17 +23,22 @@ TOAST_HEIGHT      = 80
 # Default values (will be overridden by .env if it exists)
 DEFAULT_HOST = ""
 DEFAULT_USER = ""
-DEFAULT_BASE_DIR = ""
-
-# Try to load values from .env file if it exists
+# We now support separate default base directories for remote and local modes.
+DEFAULT_REMOTE_BASE_DIR = ""
+DEFAULT_LOCAL_BASE_DIR  = ""
 try:
     from dotenv import load_dotenv
     load_dotenv()
     DEFAULT_HOST = os.getenv('DEFAULT_HOST', DEFAULT_HOST)
     DEFAULT_USER = os.getenv('DEFAULT_USER', DEFAULT_USER)
-    DEFAULT_BASE_DIR = os.getenv('DEFAULT_BASE_DIR', DEFAULT_BASE_DIR)
+    DEFAULT_REMOTE_BASE_DIR = os.getenv('DEFAULT_REMOTE_BASE_DIR', "")
+    DEFAULT_LOCAL_BASE_DIR  = os.getenv('DEFAULT_LOCAL_BASE_DIR', "")
 except ImportError:
     pass  # python-dotenv not installed, will use empty defaults
+
+# For startup, if remote mode is default then use remote base, else local.
+# We set Remote as the default connection mode.
+DEFAULT_BASE_DIR = DEFAULT_REMOTE_BASE_DIR
 
 # A "folder yellow" color (e.g. Windows folder style)
 FOLDER_YELLOW = (255, 201, 14)
@@ -175,9 +182,29 @@ def expand_ancestors_recursively(tree_element, node_key):
     except:
         pass
 
-def populate_tree_level(sftp, tree_element, folder_key, all_files):
+# --- NEW: local filesystem directory listing helper ---
+def local_listdir_attr(path):
+    """
+    List directory contents on the local filesystem.
+    Returns a list of simple objects with attributes:
+      - filename: the entry’s name
+      - st_mode: the result of os.lstat(...).st_mode
+    """
+    entries = []
+    for entry in os.listdir(path):
+        full_path = os.path.join(path, entry)
+        st = os.lstat(full_path)
+        entry_obj = type('LocalEntry', (object,), {})()
+        entry_obj.filename = entry
+        entry_obj.st_mode = st.st_mode
+        entries.append(entry_obj)
+    return entries
+
+# --- MODIFIED: populate_tree_level now takes an extra parameter "local_mode" ---
+def populate_tree_level(file_client, tree_element, folder_key, all_files, local_mode):
     """
     Expand a directory if not expanded yet. Remove dummy, list contents, add discovered files to `all_files`.
+    The parameter `file_client` is used for remote (sftp) mode.
     """
     tree_data = tree_element.TreeData
     if folder_key not in tree_data.tree_dict:
@@ -194,26 +221,42 @@ def populate_tree_level(sftp, tree_element, folder_key, all_files):
     dummy_key = f"_DUMMY_{folder_key}"
     remove_node(tree_data, dummy_key)
 
-    # Try listing the directory
+    # List directory contents using remote or local methods
     try:
-        entries = sftp.listdir_attr(folder_key)
+        if local_mode:
+            entries = local_listdir_attr(folder_key)
+        else:
+            entries = file_client.listdir_attr(folder_key)
     except Exception as e:
         show_toast(f"Cannot list {folder_key}: {e}")
         return
 
-    # Sort directories first, then files
-    entries_sorted = sorted(entries, key=lambda e: (not is_dir_attr(e.st_mode), e.filename.lower()))
+    # Sort directories first, then files.
+    entries_sorted = sorted(
+        entries,
+        key=lambda e: (not (os.path.isdir(os.path.join(folder_key, e.filename)) if local_mode else is_dir_attr(e.st_mode)), e.filename.lower())
+    )
     for entry in entries_sorted:
         name = entry.filename
-        full_path = join_sftp_path(folder_key, name)
+        if local_mode:
+            full_path = os.path.join(folder_key, name)
+        else:
+            full_path = join_sftp_path(folder_key, name)
         if full_path in tree_data.tree_dict:
             continue
 
-        if is_dir_attr(entry.st_mode):
-            add_folder_node(tree_data, folder_key, full_path, name, is_expanded=False)
+        if local_mode:
+            if os.path.isdir(full_path):
+                add_folder_node(tree_data, folder_key, full_path, name, is_expanded=False)
+            else:
+                add_file_node(tree_data, folder_key, full_path, name)
+                all_files.add(full_path)
         else:
-            add_file_node(tree_data, folder_key, full_path, name)
-            all_files.add(full_path)
+            if is_dir_attr(entry.st_mode):
+                add_folder_node(tree_data, folder_key, full_path, name, is_expanded=False)
+            else:
+                add_file_node(tree_data, folder_key, full_path, name)
+                all_files.add(full_path)
 
     tree_element.update(tree_data)
 
@@ -233,7 +276,6 @@ def short_path(base_dir, full_path):
     e.g. base_dir=/home/sam3/abc, full_path=/home/sam3/abc/hello => /hello
     If full_path doesn't start with base_dir, return full_path as-is.
     """
-    # Ensure both have no trailing slash
     bd = base_dir.rstrip('/')
     if full_path.startswith(bd):
         remainder = full_path[len(bd):]
@@ -254,35 +296,36 @@ def main():
     all_files = set()     # discovered file paths for search suggestions
     selected_files = []   # store full paths internally
     current_selected_dir = None
+    local_mode = False  # Flag: True if using local file system
 
-    # Left column
+    # ---------------------------
+    # Left Column: Connection Options
+    # ---------------------------
     left_col = [
+        # NEW: Radio buttons for connection mode.
+        [sg.Text("Connection Mode:"), 
+         sg.Radio('Remote', "MODE", key='-MODE_REMOTE-', default=True, enable_events=True),
+         sg.Radio('Local', "MODE", key='-MODE_LOCAL-', enable_events=True)],
         [sg.Text("Host"), sg.Input(DEFAULT_HOST, key='-HOST-')],
         [sg.Text("User"), sg.Input(DEFAULT_USER, key='-USERNAME-')],
         [sg.Text("Pass"), sg.Input("", password_char='*', key='-PASSWORD-')],
         [sg.Text("Base Dir")],
-        [sg.Input(DEFAULT_BASE_DIR, key='-BASE_DIR-', size=(35,1))],
+        # Set default base dir based on Remote mode (default).
+        [sg.Input(DEFAULT_REMOTE_BASE_DIR, key='-BASE_DIR-', size=(35,1))],
         [sg.Button("Connect & Load", key='-CONNECT-')],
         [sg.Text("Recents:")],
-        [
-            sg.Combo(values=[], size=(30,1), key='-RECENTS-'),  # We'll populate after connect
-            sg.Button("Add Recents", key='-ADD_RECENT-')
-        ],
+        [sg.Combo(values=[], size=(30,1), key='-RECENTS-'),
+         sg.Button("Add Recents", key='-ADD_RECENT-')],
         [sg.Text("Selected Files:")],
-        [
-            sg.Listbox(values=[], 
-                       size=(40,5), 
-                       key='-SELECTED-', 
-                       select_mode='extended')
-        ],
+        [sg.Listbox(values=[], size=(40,5), key='-SELECTED-', select_mode='extended')],
         [sg.Button("Remove Selected"), sg.Button("Clear All")],
         [sg.Button("Fetch & Append"), sg.Button("Exit", button_color=('white','firebrick4'))],
-        [
-            sg.Button("Add All (in Folder)", key='-ADD_ALL-', disabled=True)
-        ]
+        [sg.Button("Add All (in Folder)", key='-ADD_ALL-', disabled=True)]
     ]
 
-    # Middle column: closed-by-default tree
+    # ---------------------------
+    # Middle Column: Directory Tree & Search
+    # ---------------------------
     tree_data = sg.TreeData()
     dir_tree = sg.Tree(
         data=tree_data,
@@ -295,72 +338,66 @@ def main():
         show_expanded=True,
         enable_events=True
     )
-
-    # A "Google‐style" autocomplete approach with an Input + Listbox
     search_bar = sg.Input(key='-SEARCH-', enable_events=True, size=(40,1))
     suggestion_box = sg.Listbox(
-        [], 
-        key='-SUGGESTIONS-', 
-        size=(40,4), 
+        [],
+        key='-SUGGESTIONS-',
+        size=(40,4),
         visible=False,
-        select_mode='single',    
-        enable_events=True, 
+        select_mode='single',
+        enable_events=True,
         no_scrollbar=True
     )
-
     middle_col = [
-        [sg.Text("Remote Directory", font=("Helvetica", 12, "bold"))],
+        [sg.Text("Directory", font=("Helvetica", 12, "bold"))],
         [dir_tree],
         [sg.Text("Search:")],
         [search_bar],
         [suggestion_box]
     ]
 
+    # ---------------------------
+    # Right Column: Appended Text & Token Count
+    # ---------------------------
     right_col = [
         [sg.Text("Appended Text:", font=("Helvetica", 12, "bold"))],
-        [
-            sg.Multiline(
-                "", 
-                size=(60, 20), 
-                key='-APPENDED-', 
-                autoscroll=True, 
-                horizontal_scroll=True
-            )
-        ],
+        [sg.Multiline("", size=(60, 20), key='-APPENDED-', autoscroll=True, horizontal_scroll=True)],
+        # NEW: Token count display below the appended text.
+        [sg.Text("Tokens: 0", key='-TOKEN_COUNT-')],
         [sg.Button("Copy to Clipboard", key='-COPY-'), sg.Button("Clear Text", key='-CLEAR_TEXT-')]
     ]
 
     layout = [
-        [
-            sg.Column(left_col, vertical_alignment='top'),
-            sg.VerticalSeparator(color='grey'),
-            sg.Column(middle_col, vertical_alignment='top'),
-            sg.VerticalSeparator(color='grey'),
-            sg.Column(right_col, vertical_alignment='top')
-        ]
+        [sg.Column(left_col, vertical_alignment='top'),
+         sg.VerticalSeparator(color='grey'),
+         sg.Column(middle_col, vertical_alignment='top'),
+         sg.VerticalSeparator(color='grey'),
+         sg.Column(right_col, vertical_alignment='top')]
     ]
 
-    window = sg.Window(
-        "SSH File Browser & Appender",
-        layout,
-        size=(1450, 700),
-        resizable=True,
-        return_keyboard_events=True
-    )
+    window = sg.Window("SSH/Local File Browser & Appender", layout, size=(1450, 700), resizable=True, return_keyboard_events=True)
 
     ssh = None
     sftp = None
-
     current_suggestions = []
     suggestion_index = -1
 
+    # NEW: Helper to update token count using tiktoken.
+    def update_token_count():
+        try:
+            text = window['-APPENDED-'].get()
+            # Change "gpt-3.5-turbo" if you need a different model's tokenizer.
+            encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
+            token_count = len(encoding.encode(text))
+            window['-TOKEN_COUNT-'].update(f"Tokens: {token_count}")
+        except Exception as e:
+            window['-TOKEN_COUNT-'].update("Tokens: Error")
+
     def update_recents_combo(base_dir):
-        """Show short versions of each path in recents."""
         short_list = [short_path(base_dir, r) for r in recents]
         window['-RECENTS-'].update(values=short_list)
 
     def update_selected_listbox(base_dir):
-        """Show short versions of the currently selected files."""
         short_list = [short_path(base_dir, f) for f in selected_files]
         window['-SELECTED-'].update(values=short_list)
 
@@ -374,12 +411,8 @@ def main():
             return
 
         ql = query.lower()
-        # partial match on the full path
         matches_full = [f for f in all_files if ql in f.lower()]
         matches_full = matches_full[:8]
-
-        # store them as (full_path, short_path)
-        # we only show short_path in the listbox
         current_suggestions = [(fp, short_path(base_dir, fp)) for fp in matches_full]
         suggestion_index = -1
 
@@ -390,73 +423,96 @@ def main():
             window['-SUGGESTIONS-'].update(values=[], visible=False)
 
     def do_connect():
-        nonlocal ssh, sftp
-        host = values['-HOST-'].strip()
-        user = values['-USERNAME-'].strip()
-        pwd  = values['-PASSWORD-'].strip()
+        nonlocal ssh, sftp, local_mode
+        # Determine connection mode from radio buttons.
+        if values['-MODE_LOCAL-']:
+            local_mode = True
+        else:
+            local_mode = False
+
         base_dir = values['-BASE_DIR-'].strip()
-        if not host or not user or not pwd:
-            show_toast("Please fill in Host, Username, Password!", duration=3)
-            return
-
-        # close any existing connection
-        if sftp: sftp.close()
-        if ssh: ssh.close()
-
-        try:
-            ssh_, sftp_ = get_sftp_connection(host, user, pwd)
-            # If successful, set them globally
-            ssh, sftp = ssh_, sftp_
-
-            # Build tree with base_dir as root (not listing subitems until user expands)
+        if local_mode:
+            if not os.path.isdir(base_dir):
+                show_toast("Invalid local directory!", duration=3)
+                return
+            ssh = None
+            sftp = None
             new_tree = sg.TreeData()
             new_tree.Insert("", base_dir, base_dir, values=[False], icon=SMALL_FOLDER_ICON)
             all_files.clear()
-
-            # Update recents combo
             update_recents_combo(base_dir)
-
             window['-TREE-'].update(new_tree)
             window.refresh()
-
-            show_toast("Connected Successfully!", duration=3)
-        except Exception as e:
-            show_toast(f"Error connecting: {e}", duration=5)
+            show_toast("Loaded local directory successfully!", duration=3)
+        else:
+            host = values['-HOST-'].strip()
+            user = values['-USERNAME-'].strip()
+            pwd  = values['-PASSWORD-'].strip()
+            if not host or not user or not pwd:
+                show_toast("Please fill in Host, Username, and Password!", duration=3)
+                return
+            try:
+                ssh_, sftp_ = get_sftp_connection(host, user, pwd)
+                ssh, sftp = ssh_, sftp_
+                new_tree = sg.TreeData()
+                new_tree.Insert("", base_dir, base_dir, values=[False], icon=SMALL_FOLDER_ICON)
+                all_files.clear()
+                update_recents_combo(base_dir)
+                window['-TREE-'].update(new_tree)
+                window.refresh()
+                show_toast("Connected Successfully!", duration=3)
+            except Exception as e:
+                show_toast(f"Error connecting: {e}", duration=5)
 
     while True:
         event, values = window.read()
         if event in (sg.WIN_CLOSED, 'Exit'):
             break
 
-        base_dir = values['-BASE_DIR-'].strip()  # current base dir from user
+        base_dir = values['-BASE_DIR-'].strip()
+
+        # NEW: If the user switches connection mode, update the base dir accordingly.
+        if event in ('-MODE_REMOTE-', '-MODE_LOCAL-'):
+            if values['-MODE_REMOTE-']:
+                window['-BASE_DIR-'].update(DEFAULT_REMOTE_BASE_DIR)
+            else:
+                window['-BASE_DIR-'].update(DEFAULT_LOCAL_BASE_DIR)
 
         if event == '-CONNECT-':
             do_connect()
 
         elif event == '-TREE-':
-            if not sftp:
+            if (not local_mode and not sftp):
                 continue
             sel = values['-TREE-']
             if sel:
                 node_key = sel[0]
                 try:
-                    st_mode = sftp.lstat(node_key).st_mode
-                    if is_dir_attr(st_mode):
-                        # expand folder
-                        populate_tree_level(sftp, window['-TREE-'], node_key, all_files)
-                        expand_ancestors_recursively(window['-TREE-'], node_key)
-                        window['-ADD_ALL-'].update(disabled=False)
-                        current_selected_dir = node_key
+                    if local_mode:
+                        st_mode = os.lstat(node_key).st_mode
+                        if os.path.isdir(node_key):
+                            populate_tree_level(None, window['-TREE-'], node_key, all_files, local_mode)
+                            expand_ancestors_recursively(window['-TREE-'], node_key)
+                            window['-ADD_ALL-'].update(disabled=False)
+                            current_selected_dir = node_key
+                        else:
+                            if node_key not in selected_files:
+                                selected_files.append(node_key)
+                            current_selected_dir = None
+                            window['-ADD_ALL-'].update(disabled=True)
                     else:
-                        # file => add to selected
-                        if node_key not in selected_files:
-                            selected_files.append(node_key)
-                        current_selected_dir = None
-                        window['-ADD_ALL-'].update(disabled=True)
-
-                    # Update the selected listbox with short paths
+                        st_mode = sftp.lstat(node_key).st_mode
+                        if is_dir_attr(st_mode):
+                            populate_tree_level(sftp, window['-TREE-'], node_key, all_files, local_mode)
+                            expand_ancestors_recursively(window['-TREE-'], node_key)
+                            window['-ADD_ALL-'].update(disabled=False)
+                            current_selected_dir = node_key
+                        else:
+                            if node_key not in selected_files:
+                                selected_files.append(node_key)
+                            current_selected_dir = None
+                            window['-ADD_ALL-'].update(disabled=True)
                     update_selected_listbox(base_dir)
-
                 except Exception as ex:
                     show_toast(f"lstat error: {ex}")
 
@@ -465,12 +521,10 @@ def main():
             update_suggestions_box(base_dir, query)
 
         elif event == '-SUGGESTIONS-':
-            # user clicked a suggestion => fill search bar
             chosen_idx = window['-SUGGESTIONS-'].get_indexes()
             if chosen_idx:
                 idx = chosen_idx[0]
                 if 0 <= idx < len(current_suggestions):
-                    # current_suggestions is a list of (full_path, short_path)
                     full_p, short_p = current_suggestions[idx]
                     window['-SEARCH-'].update(short_p)
                     suggestion_index = idx
@@ -478,32 +532,21 @@ def main():
         elif event.startswith("Up") or event.startswith("Down") or event.startswith("special"):
             is_search_focused = (window.find_element_with_focus() == window['-SEARCH-'])
             if is_search_focused and current_suggestions:
-                # handle arrow keys for suggestion navigation
                 if "Up" in event or "16777235" in event:
-                    suggestion_index -= 1
-                    if suggestion_index < 0:
-                        suggestion_index = 0
+                    suggestion_index = max(suggestion_index - 1, 0)
                     window['-SUGGESTIONS-'].update(set_to_index=[suggestion_index])
                 elif "Down" in event or "16777237" in event:
-                    suggestion_index += 1
-                    if suggestion_index >= len(current_suggestions):
-                        suggestion_index = len(current_suggestions)-1
+                    suggestion_index = min(suggestion_index + 1, len(current_suggestions)-1)
                     window['-SUGGESTIONS-'].update(set_to_index=[suggestion_index])
-
-                # user hits Enter
                 if "Return" in event or "16777220" in event:
                     if 0 <= suggestion_index < len(current_suggestions):
                         full_p, short_p = current_suggestions[suggestion_index]
-                        # add to selected
                         if full_p not in selected_files:
                             selected_files.append(full_p)
                         update_selected_listbox(base_dir)
                     else:
                         typed = values['-SEARCH-'].strip()
                         if typed:
-                            # we have to guess the full path => no direct mapping?
-                            # We'll assume typed is a substring that existed
-                            # or just store typed as is
                             selected_files.append(typed)
                             update_selected_listbox(base_dir)
                     window['-SUGGESTIONS-'].update(values=[], visible=False)
@@ -512,13 +555,10 @@ def main():
                     window['-SEARCH-'].update("")
 
         elif event.startswith("Return") or event.startswith("special 16777220"):
-            # user pressed Enter not necessarily while in search
             is_search_focused = (window.find_element_with_focus() == window['-SEARCH-'])
             if is_search_focused and not current_suggestions:
                 typed = values['-SEARCH-'].strip()
                 if typed:
-                    # store typed as is or do an attempt to find a full path
-                    # For now, we just store typed => not guaranteed to exist
                     if typed not in selected_files:
                         selected_files.append(typed)
                     update_selected_listbox(base_dir)
@@ -526,13 +566,8 @@ def main():
                 window['-SUGGESTIONS-'].update(values=[], visible=False)
 
         elif event == '-ADD_RECENT-':
-            # The recents combo is showing short paths, so we must find the matching full
             short_value = values['-RECENTS-']
             if short_value:
-                # Convert it back to a full path by re-prepending base_dir
-                # or see if it matches an existing full path in recents
-                # Because we actually store recents as full paths
-                # we can find the index in short_pathed recents
                 try:
                     idx = [short_path(base_dir, r) for r in recents].index(short_value)
                     fullp = recents[idx]
@@ -540,13 +575,10 @@ def main():
                         selected_files.append(fullp)
                     update_selected_listbox(base_dir)
                 except ValueError:
-                    # user typed something not in recents
                     pass
 
         elif event == 'Remove Selected':
             to_remove = values['-SELECTED-']
-            # those are short paths => convert them back to full if needed
-            # We'll match them to full paths in selected_files
             all_short = [short_path(base_dir, f) for f in selected_files]
             for shorty in to_remove:
                 if shorty in all_short:
@@ -560,18 +592,22 @@ def main():
             update_selected_listbox(base_dir)
 
         elif event == 'Fetch & Append':
-            if not sftp:
+            if (not local_mode) and (not sftp):
                 show_toast("Not connected!")
                 continue
 
-            # also add newly selected tree items if they're files
             tree_sel = values['-TREE-']
             if tree_sel:
                 for item in tree_sel:
                     try:
-                        st_mode = sftp.lstat(item).st_mode
-                        if not is_dir_attr(st_mode) and item not in selected_files:
-                            selected_files.append(item)
+                        if local_mode:
+                            st_mode = os.lstat(item).st_mode
+                            if not os.path.isdir(item) and item not in selected_files:
+                                selected_files.append(item)
+                        else:
+                            st_mode = sftp.lstat(item).st_mode
+                            if not is_dir_attr(st_mode) and item not in selected_files:
+                                selected_files.append(item)
                     except:
                         pass
                 update_selected_listbox(base_dir)
@@ -583,19 +619,25 @@ def main():
             new_chunks = []
             for fpath in selected_files:
                 try:
-                    st_mode = sftp.lstat(fpath).st_mode
-                    if is_dir_attr(st_mode):
-                        new_chunks.append(f"=== {fpath} ===\n[Directory, skipping]\n")
+                    if local_mode:
+                        if os.path.isdir(fpath):
+                            new_chunks.append(f"=== {fpath} ===\n[Directory, skipping]\n")
+                        else:
+                            with open(fpath, 'r') as f:
+                                content = f.read()
+                            new_chunks.append(f"=== {fpath} ===\n{content}\n")
                     else:
-                        # read file, preserve newlines
-                        content = get_file_content_sftp(sftp, fpath)
-                        new_chunks.append(f"=== {fpath} ===\n{content}\n")
+                        st_mode = sftp.lstat(fpath).st_mode
+                        if is_dir_attr(st_mode):
+                            new_chunks.append(f"=== {fpath} ===\n[Directory, skipping]\n")
+                        else:
+                            content = get_file_content_sftp(sftp, fpath)
+                            new_chunks.append(f"=== {fpath} ===\n{content}\n")
                 except Exception as e:
                     new_chunks.append(f"=== {fpath} ===\n[Error reading file: {e}]\n")
 
             current_text = window['-APPENDED-'].get()
             appended_text = current_text + "\n".join(new_chunks) + "\n"
-
             window['-APPENDED-'].update(appended_text, visible=True)
             window.refresh()
 
@@ -609,19 +651,28 @@ def main():
 
         elif event == '-CLEAR_TEXT-':
             window['-APPENDED-'].update("")
-
+            
         elif event == '-ADD_ALL-':
-            if current_selected_dir and sftp:
+            if current_selected_dir:
                 try:
-                    entries = sftp.listdir_attr(current_selected_dir)
-                    for e in entries:
-                        full_path = join_sftp_path(current_selected_dir, e.filename)
-                        if not is_dir_attr(e.st_mode):
-                            if full_path not in selected_files:
+                    if local_mode:
+                        entries = local_listdir_attr(current_selected_dir)
+                        for e in entries:
+                            full_path = os.path.join(current_selected_dir, e.filename)
+                            if not os.path.isdir(full_path) and full_path not in selected_files:
+                                selected_files.append(full_path)
+                    else:
+                        entries = sftp.listdir_attr(current_selected_dir)
+                        for e in entries:
+                            full_path = join_sftp_path(current_selected_dir, e.filename)
+                            if not is_dir_attr(e.st_mode) and full_path not in selected_files:
                                 selected_files.append(full_path)
                     update_selected_listbox(base_dir)
                 except Exception as e:
                     show_toast(f"Cannot read folder: {e}")
+
+        # NEW: Update token count on every event iteration.
+        update_token_count()
 
     # Cleanup
     if sftp:
